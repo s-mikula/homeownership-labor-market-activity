@@ -1,0 +1,2021 @@
+---
+title: "Replication Package for 'Does homeownership hinder labor market activity? Evidence from housing privatization and restitution'"
+author: "Stepan Mikula and Josef Montag"
+date: "June 18, 2019"
+output:
+  html_document:
+    df_print: paged
+---
+
+
+Contacts: 
+
+* stepan.mikula@econ.muni.cz | [https://sites.google.com/site/stepanmikula](https://sites.google.com/site/stepanmikula/).
+* josef.montag@gmail.com | [https://sites.google.com/site/josefmontag](https://sites.google.com/site/josefmontag/).
+
+
+This package file contains R script and outputs reported in Mikula, Štěpán, and Josef Montag. 2019. Does homeownership hinder labor market activity? Evidence from housing privatization and restitution. MUNI ECON Working Paper No. 2019-06. Brno, Czech Republic: Department of Economics, Masaryk University.
+
+The manuscript is available at [https://ideas.repec.org/p/mub/wpaper/2019-06.html](https://ideas.repec.org/p/mub/wpaper/2019-06.html).
+
+#### Data availability
+
+*Privatized_houses.xls* is the database of privatized houses in Brno. For each house it contains address and the year of privatization. The dataset analyzed in the paper is built up on this database as described in the paper.
+
+The individual-level census data used in this paper were provided by the Czech Statistical Office (CSO) under the condition of confidentiality and thus cannot be provided as part of this package. However, the data can be requested from the CSO and the authors can provide help with that.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+#Load libraries and functions, set constants and load data.
+
+library(tidyverse)
+library(rgdal)
+library(broom)
+library(ggmap)
+library(stargazer)
+library(lfe)
+library(lmtest)
+library(sandwich)
+library(AER)
+library(ivpack)
+library(Formula)
+library(geosphere)
+library(DescTools)
+library(readxl)
+library(sf)
+library(ggsn)
+library(ggspatial)
+library(ggmap)
+library(cowplot)
+library(sf)
+library(knitr)
+
+rm(list = ls())
+
+# Load functions
+source("CODE/functions.R")
+
+# Constants
+
+## Filtering
+age_upper <- 61 #56
+age_lower <- 19 #25
+house_size <- 6 #6 minimum house size
+
+## Matching
+d_caliper <- 0.7
+d_distance <- 700
+
+## Robust clustered SE
+cluster_by <- "house"
+
+## Output format
+table_type <- "text"
+
+# Load data
+load("DATA_RP/RPdata.RData")
+
+# Number of digits
+dig <- 3
+```
+
+Variables in `RPdata.RData`:
+
+- `brno`...Map of Brno (sf polygon)
+- `rzsj`...Map of neighborhoods (sf polygon)
+- `rzsj_body`...Centroides of neighborhoods (sf point)
+- `rzsj_houses`...No. of houses per group (type) and neighborhood (df)
+
+- `r91_data_raw`...Census data from 1991 (no filtering applied)
+- `r91_data`...1991 Census data (houses matching with 2001 census)
+- `desc_91`...1991 Census data pre-processed for descriptives rendering
+- `r91_houses`...1991 Census data aggregated by house
+
+- `r01_data_raw`...2001 Census data (no filtering applied)
+- `r01_data_basic`...2001 Census data (estimation sample)
+- `r01_data`...2001 Census data (houses matching with 1991 census)
+
+Other variables stored in separate files:
+
+- `IDOB`...table for IDs conversion
+- `privyear`...exact year of privatization
+- `zsjsf`...equivalent of `rzsj` from `RPdata.RData`
+- `rzsj` from `rzsj_centroides.RData`...centroides of neighborhoods (different format, simple df)
+
+Key variables:
+
+- `ownership`...owner/renter
+- `RZSJ`...neighborhood code
+- `EDUC`...education level
+- `LPOHLAV`/`MALE`...gender
+- `htype`...household type
+- `BornBrno`/`BB`...individual born in Brno
+- `LVEK`...age
+- `LEKAKTI`...economic activity (1 = employed, 5 = unemployed)
+- `JPOCBYT`/`byty`...house size
+- `sample`...group of houses (ATT = privatized before 2001, NTR = restituted, NTP = privatized in 2001 or later, NTC = city-owned and never privatized)
+
+## Formulas
+
+```{r models_definition}
+# Individual data models
+model <- list(
+  I(LEKAKTI == 5) ~ ownership,
+  I(LEKAKTI == 5) ~ ownership + factor(RZSJ),
+  I(LEKAKTI == 5) ~ ownership + EDUC,
+  I(LEKAKTI == 5) ~ ownership + EDUC + LPOHLAV  + htype + BornBrno + factor(LVEK),
+  I(LEKAKTI == 5) ~ ownership + EDUC + LPOHLAV  + htype + BornBrno + factor(RZSJ) + factor(LVEK)
+) %>% lapply(as.Formula)
+
+# Change dependent variable from unemployment to economic activity
+model <- c(
+  model,
+  #model %>% lapply(update, I(LEKAKTI == 1) ~ .),
+  model %>% lapply(update, I(LEKAKTI %in% c(1,5)) ~ .)
+)
+
+model_individual <- model
+
+# Individual data models, gender-specific subsamples (not used)
+
+model_individual_gender <- model_individual %>% lapply(update, .~. - LPOHLAV)
+
+# Individual data models (IV)
+
+modeliv_individual <- list(
+  I(LEKAKTI == 5) ~ ownership | sample_dummy,
+  I(LEKAKTI == 5) ~ ownership + factor(RZSJ) | sample_dummy + factor(RZSJ),
+  I(LEKAKTI == 5) ~ ownership + EDUC | sample_dummy + EDUC,
+    I(LEKAKTI == 5) ~ ownership + EDUC + LPOHLAV  + htype + BornBrno + factor(LVEK) | sample_dummy + EDUC + LPOHLAV  + htype + BornBrno + factor(LVEK),
+  I(LEKAKTI == 5)  ~ ownership + EDUC + LPOHLAV  + htype + BornBrno + factor(RZSJ) + factor(LVEK) | sample_dummy + EDUC + LPOHLAV + htype + BornBrno + factor(RZSJ) + factor(LVEK)
+) %>% lapply(as.Formula)
+
+modeliv_1ststage <- list(
+  ownership ~ sample_dummy,
+  ownership ~ sample_dummy + factor(RZSJ),
+  ownership ~ sample_dummy + EDUC,
+  ownership ~ sample_dummy + EDUC + LPOHLAV + factor(LVEK) + htype + BornBrno,
+  ownership ~ sample_dummy + EDUC + LPOHLAV + factor(LVEK) + htype + BornBrno + factor(RZSJ)
+) %>% lapply(as.Formula)
+
+# Change dependent variable from unemployment to economic activity
+
+modeliv_individual <- c(
+  modeliv_individual,
+  modeliv_individual %>% lapply(update, I(LEKAKTI %in% c(1,5)) ~ .)
+)
+
+# Individual data models, gender-specific subsamples
+
+modeliv_individual_gender <- modeliv_individual %>% lapply(update, .~. - LPOHLAV | . - LPOHLAV)
+
+# Decision to privatize
+
+model_fs <- list(
+  I(sample != "NTC") ~ LVEK + MALE + EDUCmiddle + EDUChigh + BornBrno + byty,
+  I(sample != "NTC") ~ LVEK + MALE + EDUCmiddle + EDUChigh + BornBrno + byty + factor(RZSJ)
+) %>% lapply(as.Formula)
+
+model_fs <- c(
+  model_fs,
+  model_fs %>% lapply(update, I(sample == "ATT") ~ .)
+)
+
+model_propscore <- as.Formula(X ~ EDUChigh + EDUCmiddle + BornBrno + LVEK + MALE + JPOCBYT + U + EA)
+```
+
+
+## Summary statistics
+
+### Maps
+
+#### Figure 3a
+
+```{r}
+# Calculate no. of houses per neighborhood (ZSJ)
+rzsj_houses <- r01_data_basic %>%
+  select(adresado_01_klic,sample,RZSJ) %>% 
+  distinct() %>% 
+  #group_by(sample,RZSJ) %>%
+  group_by(RZSJ) %>% 
+  summarise(
+    obs = n()
+  ) %>% 
+  ungroup() %>% 
+  #spread(sample,obs) %>% 
+  mutate(
+    KOD_ZSJ = str_sub(RZSJ,1,6)
+  )
+
+rzsj %>% 
+  rename(geometry = SHAPE) %>% 
+  left_join(rzsj_houses) %>% 
+  ggplot() +
+  geom_sf(
+    aes(fill = obs),
+    size = 0.3
+  ) +
+  geom_sf(
+    data = brno,
+    fill = NA,
+    size = 1,
+    color = "black"
+  ) +
+  annotation_scale() +
+  coord_sf(
+    datum = NA
+  ) +
+  scale_fill_distiller(
+    name = "Number of houses",
+    palette = "YlOrRd",
+    na.value = "white",
+    guide = guide_colorbar(
+      direction = "horizontal",
+      title.position = "top" 
+        )
+  ) +
+  theme_void(
+    base_family = "times"
+  ) +
+  theme(
+    legend.position = "bottom"
+  )
+```
+
+#### Figure 3b
+
+```{r}
+bbox <- rzsj %>% 
+  rename(geometry = SHAPE) %>% 
+  left_join(rzsj_houses) %>% 
+  filter(!is.na(obs)) %>% 
+  st_bbox()
+  
+rzsj_houses <- r01_data_basic %>%
+  filter(sample %in% c("ATT","NTR")) %>% 
+  select(adresado_01_klic,sample,RZSJ) %>% 
+  distinct() %>% 
+  group_by(sample,RZSJ) %>%
+  #group_by(RZSJ) %>% 
+  summarise(
+    obs = n()
+  ) %>% 
+  ungroup() %>% 
+  spread(sample,obs) %>% 
+  mutate(
+    KOD_ZSJ = str_sub(RZSJ,1,6)
+  )
+
+ATTbody <- left_join(rzsj_body,rzsj_houses) %>% 
+  rename(geomtry = SHAPE) %>% 
+  filter(!is.na(ATT))
+
+NTRshape <- rzsj %>% 
+  rename(geometry = SHAPE) %>% 
+  left_join(rzsj_houses)
+
+NTRshape %>% 
+  ggplot() +
+  geom_sf(
+    aes(fill = NTR),
+    size = 0.3
+  ) +
+  geom_sf(
+    data = ATTbody,
+    aes(size = ATT),
+    show.legend = "point",
+    alpha = 0.6
+  ) +
+  geom_sf(
+    data = brno,
+    fill = NA,
+    size = 1,
+    color = "black"
+  ) +
+  annotation_scale() +
+  coord_sf(
+    datum = NA,
+    xlim = bbox[c(1,3)],
+    ylim = bbox[c(2,4)]
+  ) +
+  scale_fill_distiller(
+    name = "Number of restituted\nhouses",
+    palette = "YlOrRd",
+    na.value = "white",
+    guide = guide_colorbar(
+      direction = "horizontal",
+      title.position = "top" 
+        )
+  ) +
+  scale_size(
+    name = "Number of houses\nprivatized before 2001",
+    guide = guide_legend(
+      direction = "horizontal",
+      title.position = "top",
+      byrow = TRUE
+        )
+  ) +
+  theme_void(
+    base_family = "times"
+  ) +
+  theme(
+    legend.direction = "vertical"
+  ) +
+  theme(
+    legend.position = "bottom"
+  )
+```
+
+#### Table 1: Apartment buildings in Brno in 1991, means by privatization and restitution status
+
+```{r}
+desc_91 %>% 
+  mutate(
+    EDUClow = as.integer(EDUC == "low"),
+    EDUCmiddle = as.integer(EDUC == "middle"),
+    EDUChigh = as.integer(EDUC == "high")
+  ) %>% 
+  select(-EDUC) %>% 
+  group_by(adresado_01_klic,sample) %>%
+  summarise_if(is.numeric, mean, na.rm = TRUE) %>% 
+  ungroup()  -> desc_91_houses_klic
+
+desc_91_houses_klic %>% 
+  select(-adresado_01_klic) -> desc_91_houses
+
+desc_91_houses <- r91_houses %>% 
+  select(-adresado_01_klic)
+
+## City-owned
+CityOwned <- desc_91_houses %>% 
+  select(-Act) %>% 
+  filter(sample != "NTR") %>% 
+  desctable() %>% 
+  format_desctable() %>% 
+  rename(CityOwned = value)
+
+## Restituted
+Restituted <- desc_91_houses %>% 
+  select(-Act) %>% 
+  filter(sample == "NTR") %>% 
+  desctable() %>% 
+  format_desctable() %>% 
+  rename(Restituted = value)
+
+# Diff (1) and (2)
+desc_91_houses %>% 
+  select(-Act) %>% 
+  mutate(
+    sample = case_when(
+      sample != "NTR" ~ "CO",
+      TRUE ~ "NTR"
+    )
+  ) %>% 
+  gather(variable,value,-sample) %>%
+  mutate(
+    sample = factor(sample) %>% relevel(ref = "CO")
+  ) %>% 
+  #drop_na(value) %>% 
+  mutate(value = as.double(value)) %>% 
+  group_by(variable) %>% 
+  do(
+    estmlm = lm(
+      value ~ sample,
+      data = .
+    ) %>% 
+      coeftest(vcov. = vcovHC) %>% tidy() %>% 
+      filter(str_detect(term,"sample"))
+  ) %>% 
+  ungroup() %>% 
+  unnest(estmlm) %>% 
+  rowwise() %>% 
+  mutate(
+    mean = estimate %>% format(digits = 1, nsmall = dig, trim = TRUE, scientific = FALSE) %>% 
+      str_c(.,add_stars(p.value, latex = TRUE)),
+    se = std.error %>% format(digits = 1, nsmall = dig, trim = TRUE, scientific = FALSE) %>%
+      str_c("(",.,")")
+  ) %>% 
+  ungroup() %>% 
+  select(variable,mean,se) %>% 
+  gather(stat,dif1,-variable) -> dif1
+
+
+## Subgroups
+SelectedForP <- desc_91_houses %>%
+  filter(sample != "NTR") %>% 
+  filter(!is.na(Act)) %>% 
+  select(-Act) %>% 
+  desctable() %>% 
+  format_desctable() %>% 
+  rename(SelectedForP = value)
+
+SelectedForP_priv <- desc_91_houses %>%
+  filter(sample != "NTR") %>% 
+  filter(!is.na(Act)) %>% 
+  filter(sample == "ATT") %>% 
+  select(-Act) %>% 
+  desctable() %>% 
+  format_desctable() %>% 
+  rename(SelectedForP_priv = value)
+
+
+SelectedForP_notpriv <- desc_91_houses %>%
+  filter(sample != "NTR") %>% 
+  filter(!is.na(Act)) %>% 
+  filter(sample != "ATT") %>% 
+  select(-Act) %>% 
+  desctable() %>% 
+  format_desctable() %>% 
+  rename(SelectedForP_notpriv = value)
+
+NotSelected <- desc_91_houses %>% 
+  filter(sample != "NTR") %>% 
+  filter(is.na(Act)) %>% 
+  select(-Act) %>% 
+  desctable() %>% 
+  format_desctable() %>% 
+  rename(NotSelected = value)
+
+
+desc_91_houses %>% 
+  filter(sample != "NTR") %>% 
+  mutate(
+    sample = case_when(
+      is.na(Act) ~ "NDp",
+      TRUE ~ "Dp"
+    )
+  ) %>% 
+  select(-Act) %>% 
+  gather(variable,value,-sample) %>%
+  mutate(
+    sample = factor(sample) %>% relevel(ref = "Dp")
+  ) %>% 
+  #drop_na() %>% 
+  mutate(value = as.double(value)) %>% 
+  group_by(variable) %>%
+  do(
+    estmlm = lm(
+      value ~ sample,
+      data = .
+    ) %>% 
+      coeftest(vcov. = vcovHC) %>% tidy() %>% 
+      filter(str_detect(term,"sample"))
+  ) %>% 
+  ungroup() %>% 
+  unnest(estmlm) %>% 
+  rowwise() %>% 
+  mutate(
+    mean = estimate %>% format(digits = 1, nsmall = dig, trim = TRUE, scientific = FALSE) %>% 
+      str_c(.,add_stars(p.value, latex = TRUE)),
+    se = std.error %>% format(digits = 1, nsmall = dig, trim = TRUE, scientific = FALSE) %>%
+      str_c("(",.,")")
+  ) %>% 
+  ungroup() %>% 
+  select(variable,mean,se) %>% 
+  gather(stat,dif2,-variable) -> dif2
+
+
+FullSample <- desc_91_houses %>% 
+  #filter(sample != "NTR") %>% 
+  #filter(is.na(Act)) %>% 
+  select(-Act) %>% 
+  desctable() %>% 
+  format_desctable() %>% 
+  rename(FullSample = value)
+
+house_tab91 <- list(
+  #FullSample,
+  Restituted,
+  CityOwned,
+  NotSelected,
+  SelectedForP,
+  SelectedForP_priv,
+  SelectedForP_notpriv,
+  dif1,
+  dif2
+) %>% 
+  reduce(full_join) %>%
+  mutate(
+    variable = ifelse(stat == "n","obs",variable)
+  ) %>% 
+  filter(
+    !(variable %in% c("EXP","E"))
+  ) %>% 
+  gather(sample,value,-variable,-stat) %>% 
+  mutate(
+    value = ifelse(stat == "n",as.character(as.integer(value)),value)
+  ) %>% 
+  spread(sample,value) %>% 
+  mutate(
+    variable = factor(
+      variable,
+      levels = c("EA","E","U","MALE","LVEK","EDUClow","EDUCmiddle","EDUChigh",
+                                             "EXP","BB",
+                                             "htypeComplete_family","htypeIncomplete_family",
+                                             "htypeNon_family_household","htypeOne_person_household","POC_BYTU","obs"),
+                       labels = c("Economically active (share)",
+                                  "Employed (share)",
+                                  "Unemployed (share)",
+                                  "Male (share)", "Age",
+                                  "Primary education (share)", 
+                                  "Secondary education (share)", 
+                                  "Tertiary education (share)",
+                                  "Potential experience","Born in Brno (share)",
+                                  "Household type: Complete family",
+                                  "Household type: Incomplete family",
+                                  "Household type: Non-family household",
+                                  "Household type: One-person household",
+                                  "Number of apartments",
+                                  "Houses")
+    )
+  ) %>% 
+  arrange(variable,stat) %>%
+  mutate_all(as.character) %>% 
+  mutate(
+    variable = ifelse(stat == "se","",variable)
+  ) %>% 
+  select(
+    variable,
+  #FullSample,
+  Restituted,
+  CityOwned,
+  NotSelected,
+  SelectedForP,
+  SelectedForP_priv,
+  SelectedForP_notpriv,
+  dif1,
+  dif2
+  )
+
+house_tab91 %>% 
+  mutate_all(replace_na,"") %>% 
+  mutate_all(str_remove_all,"\\\\c") %>% 
+      mutate_all(str_remove_all,"\\{") %>% 
+      mutate_all(str_remove_all,"\\}") %>% 
+      mutate_all(str_remove_all,"\\^") %>% 
+  kable(
+    col.names = c(
+      "Variable",
+      str_c("(",1:8,")")
+    )
+  )
+```
+
+#### Table 2: Working age (18 to 60 years) individuals in Brno in 2001, means by privatization and restitution status of the house
+
+```{r}
+r01_data_basic %>% 
+  select(one_of(all.vars(model[[5]])),adresado_01_klic,flat_ID,sample,priv_year,Act,LVEK) %>% 
+  drop_na(-priv_year,-Act) %>% 
+  mutate(
+    U = as.integer(LEKAKTI == 5),
+    #E = as.integer(LEKAKTI == 1),
+    EA = as.integer(LEKAKTI %in% c(1,5)),
+    owner = as.integer(ownership == "owner"),
+    EDUClow = as.integer(EDUC == "low"),
+    EDUCmiddle = as.integer(EDUC == "middle"),
+    EDUChigh = as.integer(EDUC == "high"),
+    MALE = as.integer(LPOHLAV == "male"),
+    htypeIncomplete_family = as.integer(htype == "Incomplete_family"),
+    htypeComplete_family = as.integer(htype == "Complete_family"),
+    htypeOne_person_household = as.integer(htype == "One_person_household")
+  ) %>% 
+  #select(-EXP) %>% 
+  select(-LEKAKTI,-ownership,-EDUC,-LPOHLAV,-RZSJ,-htype) -> desc01_ind
+
+
+## Restituted
+
+Ntab <- desc01_ind %>% 
+  filter(sample == "NTR") %>% 
+  summarise(
+    individuals = n(),
+    houses = unique(adresado_01_klic) %>% length(),
+    households = unique(flat_ID) %>% length()
+  ) %>% mutate_all(as.character) %>% 
+  gather(variable,value) %>% 
+  mutate(stat = "n")
+
+NTRstat <- desc01_ind %>% 
+  filter(sample == "NTR") %>% 
+  select(-Act,-adresado_01_klic,-flat_ID) %>% 
+  desctable() %>%
+  format_desctable() %>% 
+  bind_rows(.,Ntab) %>% 
+  rename(NTR = value)
+
+## City-owned
+
+Ntab <- desc01_ind %>% 
+  filter(sample != "NTR") %>% 
+  summarise(
+    individuals = n(),
+    houses = unique(adresado_01_klic) %>% length(),
+    households = unique(flat_ID) %>% length()
+  ) %>% mutate_all(as.character) %>% 
+  gather(variable,value) %>% 
+  mutate(stat = "n")
+
+COstat <- desc01_ind %>% 
+  filter(sample != "NTR") %>% 
+  select(-Act,-adresado_01_klic,-flat_ID) %>% 
+  desctable() %>%
+  format_desctable() %>% 
+  bind_rows(.,Ntab) %>% 
+  rename(CO = value)
+
+## Privatized
+Ntab <- desc01_ind %>% 
+  filter(sample == "ATT") %>% 
+  summarise(
+    individuals = n(),
+    houses = unique(adresado_01_klic) %>% length(),
+    households = unique(flat_ID) %>% length()
+  ) %>% mutate_all(as.character) %>% 
+  gather(variable,value) %>% 
+  mutate(stat = "n")
+
+ATTstat <- desc01_ind %>% 
+  filter(sample == "ATT") %>% 
+  select(-Act,-adresado_01_klic,-flat_ID) %>% 
+  desctable() %>%
+  format_desctable() %>% 
+  bind_rows(.,Ntab) %>% 
+  rename(ATT = value)
+
+## City-owned/NTP
+
+Ntab <- desc01_ind %>% 
+  filter(sample == "NTP") %>% 
+  summarise(
+    individuals = n(),
+    houses = unique(adresado_01_klic) %>% length(),
+    households = unique(flat_ID) %>% length()
+  ) %>% mutate_all(as.character) %>% 
+  gather(variable,value) %>% 
+  mutate(stat = "n")
+
+NTPstat <- desc01_ind %>% 
+  filter(sample == "NTP") %>% 
+  select(-Act,-adresado_01_klic,-flat_ID) %>% 
+  desctable() %>%
+  format_desctable() %>% 
+  bind_rows(.,Ntab) %>% 
+  rename(NTP = value)
+
+## City-owned/NTC
+
+Ntab <- desc01_ind %>% 
+  filter(sample == "NTC") %>% 
+  summarise(
+    individuals = n(),
+    houses = unique(adresado_01_klic) %>% length(),
+    households = unique(flat_ID) %>% length()
+  ) %>% mutate_all(as.character) %>% 
+  gather(variable,value) %>% 
+  mutate(stat = "n")
+
+NTCstat <- desc01_ind %>% 
+  filter(sample == "NTC") %>% 
+  select(-Act,-adresado_01_klic,-flat_ID) %>% 
+  desctable() %>%
+  format_desctable() %>% 
+  bind_rows(.,Ntab) %>% 
+  rename(NTC = value)
+
+
+### dif1
+
+desc01_ind %>% 
+  filter(sample %in% c("NTR","ATT")) %>% 
+  select(-Act,-adresado_01_klic,-flat_ID) %>% 
+  select(-priv_year) %>% 
+  gather(variable,value,-sample) %>% 
+  mutate(
+    sample = factor(sample) %>% relevel(ref = "ATT")
+  ) %>% 
+  group_by(variable) %>% 
+  do(
+    estmlm = lm(
+      value ~ sample,
+      data = .
+    ) %>% 
+      coeftest(vcov. = vcovHC) %>% tidy() %>% 
+      filter(str_detect(term,"sample"))
+  ) %>% 
+  ungroup() %>% 
+  unnest(estmlm) %>% 
+  rowwise() %>% 
+  mutate(
+    mean = estimate %>% format(digits = 1, nsmall = 3, trim = TRUE, scientific = FALSE) %>% 
+      str_c(.,add_stars(p.value, latex = TRUE)),
+    se = std.error %>% format(digits = 1, nsmall = 3, trim = TRUE, scientific = FALSE) %>%
+      str_c("(",.,")")
+  ) %>% 
+  ungroup() %>% 
+  select(variable,mean,se) %>% 
+  gather(stat,dif1,-variable) -> dif1
+  
+
+
+estsamp2001 <- list(
+  NTRstat,
+  ATTstat,
+  NTPstat,
+  NTCstat,
+  COstat,
+  dif1
+) %>% 
+  reduce(full_join) %>%
+  # mutate(
+  #   variable = ifelse(stat == "n","obs",variable)
+  # ) %>% 
+  filter(
+    !(variable %in% c("EXP","E","Observations"))
+  ) %>% 
+  gather(
+  sample,value,-variable,-stat
+  ) %>% 
+  mutate(
+    value = ifelse(stat == "n", format(as.integer(value), big.mark = ",", trim = TRUE), value)
+  ) %>% 
+  spread(sample,value) %>% 
+  mutate(
+    variable = factor(
+      variable,
+      levels = c("EA","E","U","MALE","LVEK","EDUClow","EDUCmiddle","EDUChigh",
+                                             "EXP","BornBrno",
+                                             "htypeComplete_family","htypeIncomplete_family",
+                                             "htypeNon_family_household","htypeOne_person_household","owner",
+                 "individuals","households","houses"),
+                       labels = c("Economically active (=1)",
+                                  "Employed (=1)",
+                                  "Unemployed (=1)",
+                                  "Male (=1)", "Age",
+                                  "Primary education (=1)", 
+                                  "Secondary education (=1)",
+                                  "Tertiary education (=1)",
+                                  "Potential experience","Born in Brno (=1)",
+                                  "Household type: Complete family (=1)",
+                                  "Household type: Incomplete family (=1)",
+                                  "Household type: Non-family household (=1)",
+                                  "Household type: One-person household (=1)",
+                                  "Owner (=1)",
+                                  "Individuals",
+                                  "Households",
+                                  "Houses")
+    )
+  ) %>% 
+  arrange(variable,stat) %>% 
+  mutate_all(as.character) %>% 
+  mutate(
+    variable = ifelse(stat == "se","",variable)
+  ) %>% 
+  select(
+    variable,
+    NTR,
+  ATT,
+  NTP,
+  NTC,
+  CO,
+  dif1
+  )
+
+estsamp2001  %>% 
+  mutate_all(as.character) %>% 
+  mutate_all(replace_na,"") %>% 
+  mutate_all(str_remove_all,"\\\\c") %>% 
+      mutate_all(str_remove_all,"\\{") %>% 
+      mutate_all(str_remove_all,"\\}") %>% 
+      mutate_all(str_remove_all,"\\^") %>% 
+  kable(
+    col.names = c(
+      "Variable",
+      str_c("(",1:6,")")
+    )
+  )
+```
+
+## Regressions
+
+## OLS
+
+### Table 3: Homeownership and labor market activity (OLS), individuals from houses privatized before 2001 and all restituted houses // Table A2 in the laste version of the manuscript
+
+```{r}
+model <- model_individual
+
+# Remove incomplete observations
+model %>% 
+  lapply(all.vars) %>% 
+  unlist() %>% 
+  unique() %>% 
+  c("flat_ID","sample","RZSJ","MALE","adresado_01_klic",.) -> all_vars
+
+r01_data_x <- r01_data_basic %>%
+  dplyr::select(one_of(all_vars)) %>% 
+  drop_na()
+```
+
+```{r fullNAIVE, results = 'asis'}
+r01_data_x %>% 
+  filter(sample %in% c("ATT","NTR")) -> reg_data
+
+reg_data_ea <- reg_data %>% filter(LEKAKTI %in% c(1,5))
+
+#save(reg_data, reg_data_ea, file = "DATA/processed/fullNAIVE_data.RData")
+
+c(
+  model[1:5] %>% lapply(function(x) lm(x, data = reg_data_ea)),
+  model[6:10] %>% lapply(function(x) lm(x, data = reg_data))
+  ) -> estm
+
+if(cluster_by == "flat"){
+  c(
+    estm[1:5] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_ea$flat_ID))),
+    estm[6:10] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data$flat_ID)))
+  ) -> estm_ctest
+}else{
+  c(
+    estm[1:5] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_ea$adresado_01_klic))),
+    estm[6:10] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data$adresado_01_klic)))
+  ) -> estm_ctest
+}
+
+get_tables(estm, estm_ctest, reorder = c(6,7,8,9,10,1,2,3,4,5), space = FALSE) %>% 
+  mutate_all(replace_na,"") %>% 
+  kable(
+    col.names = c(
+      "Variable",
+      str_c("(",1:10,")")
+    )
+  )
+```
+
+
+
+## Matching
+
+```{r}
+#Add RZSJ coordinates.
+houses <- r01_data %>% 
+  group_by(adresado_01_klic) %>%
+  dplyr::summarise(
+    RCASTOBCE = first(RCASTOBCE),
+    RZSJ = first(RZSJ)#,
+    #JPOCBYT = first(JPOCBYT)
+  ) %>% 
+  mutate(
+    RZSJ = str_sub(RZSJ, start = 1, end = 6)
+  ) %>% 
+  ungroup() %>% 
+  distinct()
+
+load("DATA_RP/rzsj_centroides.RData")
+
+rzsj %>%
+  as.data.frame() %>% 
+  as_data_frame() %>% 
+  dplyr::select(
+    RZSJ = KOD_ZSJ, long = coords.x1, lat = coords.x2
+  ) %>% 
+  mutate(
+    RZSJ = as.character(RZSJ)
+  ) %>% 
+  distinct() %>% 
+  left_join(houses,., by = "RZSJ") %>% 
+  drop_na() -> houses
+
+desc_91_houses_klic %>% 
+  left_join(houses) -> r91_houses
+```
+
+
+
+### Table A1: Balancing test (means), matched houses in 1991 // Table 3 in the last version of the manuscript
+
+```{r}
+# Propensity score
+r91_houses %>%
+  dplyr::select(-Act) %>%
+  filter(sample %in% c("ATT","NTR")) %>%
+  filter(adresado_01_klic %in% r01_data_basic$adresado_01_klic) %>%
+  #filter(JPOCBYT >= 6) %>%
+  rename(JPOCBYT = POC_BYTU) %>%
+  mutate(
+    byty = cut(JPOCBYT, c(0,10,20,40), right = FALSE)
+  ) %>%
+  drop_na() %>%
+  rename(BornBrno = BB) -> r91_houses_sample1
+
+
+att_selection <- glm(update(model_propscore, I(sample == "ATT") ~ .), 
+                     data = r91_houses_sample1, family = binomial("logit"))
+
+r91_houses_sample1 %>% 
+  predict.glm(att_selection, type = "response", newdata = .) -> r91_houses_sample1$pscore
+
+
+### Regression data
+modeliv <- modeliv_individual #%>% lapply(matchingFE)
+model_rob <- modeliv[[5]]
+
+# Remove incomplete observations
+model_rob %>% 
+  lapply(all.vars) %>% 
+  unlist() %>% 
+  unique() %>% 
+  c("flat_ID","sample","RZSJ","MALE","adresado_01_klic","person_ID",.) -> all_vars
+
+r01_data_x <- r01_data_basic %>%
+  dplyr::select(one_of(all_vars)) %>% 
+  drop_na()
+
+r01_data_x %>% 
+  filter(sample %in% c("ATT","NTR")) %>% 
+  mutate(
+    ownership = ownership == "owner",
+    sample_dummy = sample == "ATT"
+    ) -> reg_data
+
+reg_data_ea <- reg_data %>% filter(LEKAKTI %in% c(1,5))
+
+## Unemployment
+
+load("DATA_RP/zsjsf.RData")
+
+crossing(
+  C = seq(from=0.1, to = 0.9, by = 0.1),
+  D = c(100,400,700,1000)
+) %>% 
+  #filter(D %in% c(100,400,700,1000)) %>%
+  # filter(D == 700) %>% 
+  # filter(C == 0.4) %>% 
+  rowwise() %>% 
+  mutate(
+    match = get_matched.geo(r91_houses_sample1, C, D, geo = zsjsf) %>% list(),
+    #match = matchO$DataX %>% list(),
+    emod  = get_ownership.g0(match$match, xdata = reg_data_ea, xmodel = model_rob) %>% list(),
+    owner = emod$coefs %>% filter(str_detect(term,"ownershipTRUE")) %>% list()
+  ) -> outputs_U
+
+
+outputs_U %>% 
+  unnest(owner) %>% 
+  rowwise() %>% 
+  mutate(
+    n_t = match$match %>% filter(ctg == "treatment") %>% distinct(adresado_01_klic) %>% nrow(),
+    n_c = match$match %>% filter(ctg == "control") %>% distinct(adresado_01_klic) %>% nrow()
+  ) -> outputs_U
+
+
+# Balance test
+outputs_U %>% 
+  #filter(C==d_caliper,D==d_distance) %>%
+  filter(is_equal(C,d_caliper)) %>% 
+  filter(is_equal(D,d_distance)) %>% 
+  pull(match) -> baseline_match
+
+aux <- baseline_match[[1]]$match %>% 
+  left_join(r91_houses_sample1, by = "adresado_01_klic") %>% 
+  select(-adresado_01_klic,-sample,-RZSJ,-RCASTOBCE,-long,-lat,-byty) %>% 
+  gather(variable,value,-ctg,-id,-W)
+
+aux1 <- aux %>% 
+  group_by(ctg,variable) %>% 
+  do(
+    mean = lm(value ~ 1, data = ., weights = W) %>% coeftest(vcov. = vcovHC) %>% tidy() %>% filter(str_detect(term,"Intercept"))
+  ) %>% 
+  ungroup() %>% 
+  unnest(mean) %>%
+  rowwise() %>% 
+  mutate(
+    estimate = format(estimate, digits = 1, nsmall=3, trim = TRUE, scientific = FALSE),
+    std.error = format(std.error, digits = 1, nsmall=3, trim = TRUE, scientific = FALSE) %>% str_c("(",.,")")
+  ) %>% 
+  ungroup() %>% 
+  select(ctg,variable,estimate,std.error) %>% 
+  gather(stat,value,-ctg,-variable) %>% 
+  spread(ctg,value)
+
+aux %>% 
+  mutate(
+    ctg = factor(ctg) %>% relevel(ref = "control")
+  ) %>% 
+  group_by(variable) %>% 
+  do(
+    dif = lm(value ~ ctg, data = ., weights = W) %>% coeftest(vcov. = vcovHC) %>% tidy() %>% filter(str_detect(term,"ctg"))
+  ) %>% 
+  ungroup() %>% 
+  unnest(dif) %>%
+  rowwise() %>% 
+  mutate(
+    estimate = format(estimate, digits = 1, nsmall = 3, trim = TRUE, scientific = FALSE) %>% str_c(.,add_stars(p.value, latex = TRUE)),
+    std.error = format(std.error, digits = 1, nsmall = 3, trim = TRUE, scientific = FALSE) %>% str_c("(",.,")")
+  ) %>% 
+  select(variable,estimate,std.error) %>%
+  gather(stat,dif,-variable) %>% 
+  left_join(aux1,.) %>% 
+  filter(!(variable %in% c("EXP","E","POC_BYTU","W"))) %>% 
+  #distinct(variable)
+  mutate(
+    variable = factor(
+      variable,
+      levels = c("EA","E","U","MALE","LVEK","EDUClow","EDUCmiddle","EDUChigh",
+                                             "EXP","BornBrno",
+                                             "htypeComplete_family","htypeIncomplete_family",
+                                      "htypeNon_family_household","htypeOne_person_household","owner","JPOCBYT","pscore","obs"),
+                       labels = c("Economically active (share)",
+                                  "Employed (share)",
+                                  "Unemployed (share)",
+                                  "Male (share)", "Age",
+                                  "Primary education (share)", 
+                                  "Secondary education (share)", 
+                                  "Tertiary education (share)",
+                                  "Potential experience","Born in Brno (share)",
+                                  "Household type: Complete family (=1)",
+                                  "Household type: Incomplete family (=1)",
+                                  "Household type: Non-family household (=1)",
+                                  "Household type: One-person household (=1)",
+                                  "Owner (=1)",
+                                  "Number of apartments",
+                                  "Propensity score",
+                                  "Observations (houses)")
+    )
+  ) %>% 
+  select(variable,treatment,control,dif,stat) %>% 
+  arrange(variable,stat) %>% 
+  mutate_all(as.character) %>% 
+  mutate(
+    variable = ifelse(stat == "std.error","",variable)
+    #dif = ifelse(stat == "std.error","",dif)
+  ) %>% 
+  select(-stat) -> match_balance
+ 
+tribble(
+  ~variable,~treatment,~control,~dif,
+  "Houses",
+  str_c(
+    as.character(length(unique(baseline_match[[1]]$match_obj$index.treated))) %>% str_c("\\c{",.,"}")
+    # "/",
+    #as.character(length(baseline_match[[1]]$match_obj$index.treated))
+  ),
+  str_c(
+    as.character(length(unique(baseline_match[[1]]$match_obj$index.control))) %>% str_c("\\c{",.,"}")
+    # "/",
+    #as.character(length(baseline_match[[1]]$match_obj$index.control))
+  ),
+  ""
+) %>% 
+bind_rows(match_balance,.) %>% 
+   mutate_all(as.character) %>% 
+  mutate_all(replace_na,"") %>% 
+  mutate_all(str_remove_all,"\\\\c") %>% 
+      mutate_all(str_remove_all,"\\{") %>% 
+      mutate_all(str_remove_all,"\\}") %>% 
+      mutate_all(str_remove_all,"\\^") %>% 
+  kable(
+    col.names = c(
+      "Variable",
+      str_c("(",1:3,")")
+    )
+  )
+```
+## Balance test W
+```{r}
+aux <- baseline_match[[1]]$match %>% 
+  left_join(r91_houses_sample1, by = "adresado_01_klic") %>% 
+  distinct(adresado_01_klic, .keep_all = TRUE) %>% 
+  select(-adresado_01_klic,-sample,-RZSJ,-RCASTOBCE,-long,-lat,-byty) %>% 
+  gather(variable,value,-ctg,-id,-W)
+
+aux1 <- aux %>% 
+  group_by(ctg,variable) %>% 
+  do(
+    mean = lm(value ~ 1, data = .) %>% coeftest(vcov. = vcovHC) %>% tidy() %>% filter(str_detect(term,"Intercept"))
+  ) %>% 
+  ungroup() %>% 
+  unnest(mean) %>%
+  rowwise() %>% 
+  mutate(
+    estimate = format(estimate, digits = 1, nsmall=3, trim = TRUE, scientific = FALSE),
+    std.error = format(std.error, digits = 1, nsmall=3, trim = TRUE, scientific = FALSE) %>% str_c("(",.,")")
+  ) %>% 
+  ungroup() %>% 
+  select(ctg,variable,estimate,std.error) %>% 
+  gather(stat,value,-ctg,-variable) %>% 
+  spread(ctg,value)
+
+aux %>% 
+  mutate(
+    ctg = factor(ctg) %>% relevel(ref = "control")
+  ) %>% 
+  group_by(variable) %>% 
+  do(
+    dif = lm(value ~ ctg, data = .) %>% coeftest(vcov. = vcovHC) %>% tidy() %>% filter(str_detect(term,"ctg"))
+  ) %>% 
+  ungroup() %>% 
+  unnest(dif) %>%
+  rowwise() %>% 
+  mutate(
+    estimate = format(estimate, digits = 1, nsmall = 3, trim = TRUE, scientific = FALSE) %>% str_c(.,add_stars(p.value, latex = TRUE)),
+    std.error = format(std.error, digits = 1, nsmall = 3, trim = TRUE, scientific = FALSE) %>% str_c("(",.,")")
+  ) %>% 
+  select(variable,estimate,std.error) %>%
+  gather(stat,dif,-variable) %>% 
+  left_join(aux1,.) %>% 
+  filter(!(variable %in% c("EXP","E","POC_BYTU","W"))) %>% 
+  #distinct(variable)
+  mutate(
+    variable = factor(
+      variable,
+      levels = c("EA","E","U","MALE","LVEK","EDUClow","EDUCmiddle","EDUChigh",
+                                             "EXP","BornBrno",
+                                             "htypeComplete_family","htypeIncomplete_family",
+                                      "htypeNon_family_household","htypeOne_person_household","owner","JPOCBYT","pscore","obs"),
+                       labels = c("Economically active (share)",
+                                  "Employed (share)",
+                                  "Unemployed (share)",
+                                  "Male (share)", "Age",
+                                  "Primary education (share)", 
+                                  "Secondary education (share)", 
+                                  "Tertiary education (share)",
+                                  "Potential experience","Born in Brno (share)",
+                                  "Household type: Complete family (=1)",
+                                  "Household type: Incomplete family (=1)",
+                                  "Household type: Non-family household (=1)",
+                                  "Household type: One-person household (=1)",
+                                  "Owner (=1)",
+                                  "Number of apartments",
+                                  "Propensity score",
+                                  "Observations (houses)")
+    )
+  ) %>% 
+  select(variable,treatment,control,dif,stat) %>% 
+  arrange(variable,stat) %>% 
+  mutate_all(as.character) %>% 
+  mutate(
+    variable = ifelse(stat == "std.error","",variable)
+    #dif = ifelse(stat == "std.error","",dif)
+  ) %>% 
+  select(-stat) -> match_balance
+ 
+tribble(
+  ~variable,~treatment,~control,~dif,
+  "Houses",
+  str_c(
+    as.character(length(unique(baseline_match[[1]]$match_obj$index.treated))) %>% str_c("\\c{",.,"}")
+    # "/",
+    #as.character(length(baseline_match[[1]]$match_obj$index.treated))
+  ),
+  str_c(
+    as.character(length(unique(baseline_match[[1]]$match_obj$index.control))) %>% str_c("\\c{",.,"}")
+    # "/",
+    #as.character(length(baseline_match[[1]]$match_obj$index.control))
+  ),
+  ""
+) %>% 
+bind_rows(match_balance,.) %>% 
+   mutate_all(as.character) %>% 
+  mutate_all(replace_na,"") %>% 
+  mutate_all(str_remove_all,"\\\\c") %>% 
+      mutate_all(str_remove_all,"\\{") %>% 
+      mutate_all(str_remove_all,"\\}") %>% 
+      mutate_all(str_remove_all,"\\^") -> Tab3print
+
+Tab3print %>% print_latex("match_balance.tex")
+
+Tab3print %>% 
+  kable(
+    col.names = c(
+      "Variable",
+      str_c("(",1:3,")")
+    )
+  )
+```
+
+
+
+```{r}
+## Economic activity
+modeliv <- modeliv_individual #%>% lapply(matchingFE)
+model_rob <- modeliv[[10]]
+
+outputs_U %>% 
+  select(C,D,match) %>% 
+  rowwise() %>% 
+  mutate(
+    #match = get_matched.g0(r91_houses_sample1, C, D) %>% list(),
+    emod  = get_ownership.g0(match$match, xdata = reg_data, xmodel = model_rob) %>% list(),
+    owner = emod$coefs %>% filter(str_detect(term,"ownershipTRUE")) %>% list()
+  ) -> outputs_EA
+
+outputs_EA %>% 
+  unnest(owner) %>% 
+  rowwise() %>% 
+  mutate(
+    n_t = match$match %>% dplyr::filter(ctg == "treatment") %>% distinct(adresado_01_klic) %>% nrow(),
+    n_c = match$match %>% dplyr::filter(ctg == "control") %>% distinct(adresado_01_klic) %>% nrow(),
+  ) -> outputs_EA
+
+```
+
+### Table 8: Differences in characteristics of working age individuals living in matched restituted and privatized houses between 2001 and 1991 // Table 6 in the last version of the manuscript
+
+```{r}
+# Balance test
+outputs_U %>% 
+  #filter(C==d_caliper,D==d_distance) %>%
+  filter(is_equal(C,d_caliper)) %>% 
+  filter(is_equal(D,d_distance)) %>% 
+  pull(match) -> baseline_match
+
+### Balance in working population (1991)
+r91_data_BT <- r91_data %>% 
+  filter(LVEK < age_upper) %>% 
+  left_join(baseline_match[[1]]$match,.) %>% 
+  group_by(ctg) %>% 
+  mutate(obs = n()) %>% 
+  ungroup() %>% 
+  select(W,ctg,one_of(all.vars(model_propscore)),EDUC,obs,adresado_01_klic) %>% 
+  mutate(
+    BornBrno = as.integer(BornBrno),
+    EDUChigh = as.integer(EDUC == "high"),
+    EDUClow = as.integer(EDUC == "low"),
+    EDUCmiddle = as.integer(EDUC == "middle")
+  ) %>% 
+  select(-EDUC) %>% 
+  gather(variable,value,-W,-ctg,-obs,-adresado_01_klic) %>% 
+  mutate(
+    census = "1991"
+  )
+
+r01_data_BT <- r01_data_raw %>% 
+  filter(LVEK >= age_lower) %>% 
+  filter(LVEK < age_upper) %>% 
+ left_join(baseline_match[[1]]$match,.) %>% 
+  group_by(ctg) %>% 
+  mutate(obs = n()) %>% 
+  ungroup() %>% 
+  select(W,ctg,one_of(all.vars(model_propscore)),EDUC,LEKAKTI,obs,adresado_01_klic) %>% 
+  mutate(
+    U = as.integer(LEKAKTI == 5),
+    EA = as.integer(LEKAKTI %in% c(1,5)),
+    BornBrno = as.integer(BornBrno),
+    EDUChigh = as.integer(EDUC == "high"),
+    EDUClow = as.integer(EDUC == "low"),
+    EDUCmiddle = as.integer(EDUC == "middle")
+  ) %>% 
+  select(-EDUC,-LEKAKTI,-JPOCBYT) %>% 
+  gather(variable,value,-W,-ctg,-obs,-adresado_01_klic) %>% 
+  mutate(
+    census = "2001"
+  )
+
+TimeTravel <- bind_rows(
+  r91_data_BT,
+  r01_data_BT
+) %>% 
+  mutate(
+    ctg = factor(ctg) %>% relevel(ref = "control"),
+    census = factor(census) %>% relevel(ref = "1991")
+  )
+
+OBS <- TimeTravel %>% 
+  group_by(ctg,census) %>% 
+  summarise(
+    obs = mean(obs) %>% as.integer() %>% format(big.mark = ",", trim = TRUE) %>% str_c("\\c{",.,"}")
+  ) %>% 
+  ungroup() %>% 
+  spread(ctg,obs) %>% 
+  mutate(
+    variable = str_c("obs_",census),
+    stat = "n"
+  ) %>% 
+  select(-census)
+
+aux <- TimeTravel %>% 
+  group_by(ctg,variable) %>% 
+  do(
+    lm = felm(value ~ census | 0 | 0 | adresado_01_klic, data = ., weights = .$W) %>% 
+      coeftest() %>% 
+      tidy() %>% 
+      filter(str_detect(term,"census"))
+  ) %>% 
+  ungroup() %>% 
+  unnest(lm) %>% 
+  rowwise() %>% 
+  mutate(
+    estimate = format(estimate, digits = 1, nsmall = 3, trim=TRUE, scientific = FALSE) %>% 
+      str_c(.,add_stars(p.value,latex = TRUE)),
+    std.error = format(std.error, digits = 1, nsmall = 3, trim = TRUE, scientific = FALSE) %>% 
+      str_c("(",.,")")
+  ) %>% 
+  ungroup() %>% 
+  select(ctg,variable,estimate,std.error) %>% 
+  gather(stat,value,-ctg,-variable) %>% 
+  spread(ctg,value)
+  
+TimeTravel %>% 
+  group_by(variable) %>% 
+  do(
+    lm = felm(value ~ ctg*census | 0 | 0 | adresado_01_klic, data = ., weights = .$W) %>% 
+      coeftest() %>% 
+      tidy() %>% 
+      filter(str_detect(term,"treatment:census"))
+  ) %>% 
+  ungroup() %>% 
+  unnest(lm) %>% 
+  rowwise() %>% 
+  mutate(
+    estimate = format(estimate, digits = 1, nsmall = 3, trim=TRUE, scientific = FALSE) %>% 
+      str_c(.,add_stars(p.value,latex = TRUE)),
+    std.error = format(std.error, digits = 1, nsmall = 3, trim = TRUE, scientific = FALSE) %>% 
+      str_c("(",.,")")
+  ) %>% 
+  select(variable,estimate,std.error) %>% 
+  gather(stat,DID,-variable) %>% 
+  left_join(aux,.) %>% 
+  bind_rows(OBS) %>% 
+  mutate(
+    variable = factor(
+      variable,
+      levels = c("EA","E","U","MALE","LVEK","EDUClow","EDUCmiddle","EDUChigh",
+                                             "EXP","BornBrno",
+                                             "htypeComplete_family","htypeIncomplete_family",
+                                      "htypeNon_family_household","htypeOne_person_household","owner","JPOCBYT","pscore",
+                 "obs_2001","obs_1991"),
+                       labels = c("Economically active",
+                                  "Employed",
+                                  "Unemployed",
+                                  "Male", "Age",
+                                  "Primary education", 
+                                  "Secondary education", 
+                                  "Tertiary education",
+                                  "Potential experience","Born in Brno",
+                                  "Household type: Complete family",
+                                  "Household type: Incomplete family",
+                                  "Household type: Non-family household",
+                                  "Household type: One-person household",
+                                  "Owner",
+                                  "Number of apartments",
+                                  "Propensity score",
+                                  "Individuals in 2001 census",
+                                  "Individuals in 1991 census")
+    )
+  ) %>% 
+  #select(variable,treatment,control,dif,stat) %>% 
+  arrange(variable,stat) %>% 
+  mutate_all(as.character) %>% 
+  mutate(
+    variable = ifelse(stat == "std.error","",variable)
+    #dif = ifelse(stat == "std.error","",dif)
+  ) %>% 
+  select(-stat) %>% 
+   mutate_all(as.character) %>% 
+  mutate_all(replace_na,"") %>% 
+  mutate_all(str_remove_all,"\\\\c") %>% 
+      mutate_all(str_remove_all,"\\{") %>% 
+      mutate_all(str_remove_all,"\\}") %>% 
+      mutate_all(str_remove_all,"\\^") %>% 
+  kable(
+    col.names = c(
+      "Variable",
+      str_c("(",1:3,")")
+    )
+  )
+```
+
+```{r}
+auxD <- TimeTravel %>% 
+  group_by(adresado_01_klic, variable, census) %>% 
+  summarise(
+    mval = mean(value, na.rm = TRUE)
+  ) %>% 
+  spread(census,mval) %>% 
+  mutate(
+    dif = `2001` - `1991`
+  ) %>% 
+  select(adresado_01_klic,variable,dif) %>% 
+  spread(variable,dif)
+
+TimeTravel %>% 
+  group_by(adresado_01_klic) %>% 
+  summarise(
+    W = mean(W),
+    ctg = first(ctg)
+  ) %>% 
+  ungroup() %>% 
+  left_join(auxD) %>% 
+  felm(
+    I(ctg == "treatment") ~ BornBrno + EDUCmiddle + EDUChigh + LVEK + MALE,
+    data = .,
+    weights = .$W
+  ) %>% 
+  summary(robust = TRUE)
+```
+F-statistic(full model, *iid*):0.2048 on 5 and 86 DF, p-value: 0.9597 
+
+```{r balance, eval=TRUE}
+balance_vars <- c(all.vars(model_propscore)[-1],"EDUClow","pscore")
+balance_data <- r91_houses_sample1 %>% select(adresado_01_klic, one_of(balance_vars))
+  
+balance_test <- function(xmatch,xdata){
+  aux <- left_join(xmatch$match, xdata) %>% 
+    gather(variable,value,-id,-W,-ctg,-adresado_01_klic) %>% 
+    mutate(ctg = factor(ctg) %>% relevel(ref = "control")) %>% 
+    group_by(variable) %>% 
+    do(
+      lm = lm(value~ctg, data = ., weights = W) %>% coeftest(vcov. = vcovHC) %>% tidy() %>% filter(str_detect(term,"ctg"))
+    ) %>% 
+    unnest(lm)
+  
+  Pp <- aux %>% filter(variable == "pscore") %>% pull(p.value)
+  Bp <- aux %>% filter(variable != "pscore") %>% pull(p.value) %>% min()
+  
+  tribble(
+    ~Pp, ~Bp,
+    Pp, Bp
+  )
+}
+
+balance_df <- outputs_U %>% 
+  select(C,D,match) %>% 
+  rowwise() %>%
+  mutate(
+    test = balance_test(match, balance_data) %>% list()
+  ) %>% 
+  ungroup() %>% 
+  unnest(test) %>% 
+  select(-match)
+```
+
+
+#### Table A4: Estimates of the effect of homeownership on unemployment under alternative matching parameters // Table B4 in the last version of the manuscript
+
+```{r MatchingBigTables, eval=TRUE}
+outputs_U %>% 
+  ungroup() %>% 
+  left_join(.,select(balance_df,C,D,Pp,Bp)) %>% 
+  rowwise() %>% 
+  mutate(
+    Aestimate = format(estimate, digits = 1, nsmall = 3, trim = TRUE, scientific = FALSE) %>% str_c(.,add_stars(p.value, latex = TRUE, ds = TRUE)),
+    Bstd.error = format(std.error, digits = 1, nsmall = 3, trim = TRUE, scientific = FALSE) %>% str_c("(",.,")"),
+    DBp = format(Bp,digits = 1, nsmall = 3, trim = TRUE, scientific = FALSE),
+    EPp = format(Pp,digits = 1, nsmall = 3, trim = TRUE, scientific = FALSE),
+    Cn_t = str_c("Np = ",n_t)
+  ) %>% 
+  ungroup() %>% 
+  mutate(
+    Dtests = str_c("Bp = ",DBp,", Pp = ",EPp)
+  ) %>% 
+  select(C,D,Aestimate,Bstd.error,Cn_t,Dtests) %>% 
+  gather(stat,value,-C,-D) %>% 
+  mutate_if(is.numeric,as.character) %>% 
+  filter(D %in% c(100,400,700,1000)) %>% 
+  filter(C %in% c("0.1","0.2","0.3","0.4","0.5","0.6","0.7","0.8","0.9")) %>% 
+  spread(D,value) %>% 
+  arrange(C,stat) %>% 
+  mutate(
+    C = ifelse(str_detect(stat,"^A"),C,"")
+  ) %>% 
+  select(C,`100`,`400`,`700`,`1000`) %>% 
+  kable()
+```
+  
+#### Table A3: Estimates of the effect of homeownership on labor force participation under alternative matching parameters // Table B3 in the last version of the manusript
+  
+```{r}  
+outputs_EA %>% 
+  ungroup() %>% 
+  left_join(.,select(balance_df,C,D,Pp,Bp)) %>% 
+  #left_join(.,select(psttest,C,D,psttest)) %>% 
+  rowwise() %>% 
+  mutate(
+    Aestimate = format(estimate, digits = 1, nsmall = 3, trim = TRUE, scientific = FALSE) %>% str_c(.,add_stars(p.value, latex = TRUE, ds = TRUE)),
+    Bstd.error = format(std.error, digits = 1, nsmall = 3, trim = TRUE, scientific = FALSE) %>% str_c("(",.,")"),
+    DBp = format(Bp,digits = 1, nsmall = 3, trim = TRUE, scientific = FALSE),
+    EPp = format(Pp,digits = 1, nsmall = 3, trim = TRUE, scientific = FALSE),
+    Cn_t = str_c("Np = ",n_t)
+  ) %>% 
+  ungroup() %>% 
+  mutate(
+    Dtests = str_c("Bp = ",DBp,", Pp = ",EPp)
+  ) %>% 
+  select(C,D,Aestimate,Bstd.error,Cn_t,Dtests) %>% 
+  gather(stat,value,-C,-D) %>% 
+  mutate_if(is.numeric,as.character) %>% 
+  filter(D %in% c(100,400,700,1000)) %>% 
+  filter(C %in% c("0.1","0.2","0.3","0.4","0.5","0.6","0.7","0.8","0.9")) %>% 
+  spread(D,value) %>% 
+  arrange(C,stat) %>% 
+  mutate(
+    C = ifelse(str_detect(stat,"^A"),C,"")
+  ) %>% 
+  select(C,`100`,`400`,`700`,`1000`) %>% 
+  kable()
+```
+
+
+
+
+#### Table 4: Homeownership and labor market activity, IV estimates for individuals living in matched houses
+
+```{r}
+### Regression data
+model_iv <- modeliv_individual #%>% lapply(matchingFE)
+
+# Remove incomplete observations
+model_iv %>% 
+  lapply(all.vars) %>% 
+  unlist() %>% 
+  unique() %>% 
+  c("flat_ID","sample","RZSJ","MALE","adresado_01_klic","person_ID",.) -> all_vars
+
+r01_data_x <- r01_data_basic %>%
+  dplyr::select(one_of(all_vars)) %>% 
+  drop_na()
+
+r01_data_x %>% 
+  filter(sample %in% c("ATT","NTR")) %>% 
+  mutate(
+    ownership = ownership == "owner",
+    sample_dummy = sample == "ATT"
+    ) -> reg_data
+
+reg_data_ea <- reg_data %>% filter(LEKAKTI %in% c(1,5))
+
+reg_data_U <- outputs_U %>% 
+  filter(isTRUE(all.equal(C, d_caliper)), isTRUE(all.equal(D, d_distance))) %>% 
+  magrittr::extract2("match") %>% 
+  magrittr::extract2(1) %>% 
+  magrittr::extract2("match") %>% 
+  left_join(reg_data_ea)
+
+reg_data_EA <- outputs_U %>% 
+  filter(isTRUE(all.equal(C, d_caliper)), isTRUE(all.equal(D, d_distance))) %>% 
+  magrittr::extract2("match") %>% 
+  magrittr::extract2(1) %>% 
+  magrittr::extract2("match") %>% 
+  left_join(reg_data)
+
+## IV estimation
+
+c(
+  modeliv[1:5] %>% lapply(function(x) ivreg(x, data = reg_data_U, weights = W)),
+  modeliv[6:10] %>% lapply(function(x) ivreg(x, data = reg_data_EA, weights = W))
+  ) -> estm
+
+if(cluster_by == "flat"){
+  c(
+    estm[1:5] %>% lapply(function(x) cluster.robust.se(x, reg_data_U$flat_ID)),
+    estm[6:10] %>% lapply(function(x) cluster.robust.se(x, reg_data_EA$flat_ID))
+  ) -> estm_ctest
+}else{
+  c(
+    estm[1:5] %>% lapply(function(x) cluster.robust.se(x, reg_data_U$adresado_01_klic)),
+    estm[6:10] %>% lapply(function(x) cluster.robust.se(x, reg_data_EA$adresado_01_klic))
+  ) -> estm_ctest
+}
+
+get_tables(estm, estm_ctest, ivtest = TRUE, 
+           reorder = c(6,7,8,9,10,1,2,3,4,5), space = FALSE) %>% 
+  mutate_all(replace_na,"") %>% 
+  kable(
+    col.names = c(
+      "Variable",
+      str_c("(",1:10,")")
+    )
+  )
+```
+
+#### Table 5: Homeownership and labor market activity, intention-to-treat (reduced-form) estimates for individuals living in matched houses
+
+```{r}
+### Reduced form
+model_reduced <- model %>% 
+  lapply(update, . ~ sample_dummy + . - ownership)
+
+c(
+  model_reduced[1:5] %>% lapply(function(x) lm(x, data = reg_data_U, weights = W)),
+  model_reduced[6:10] %>% lapply(function(x) lm(x, data = reg_data_EA, weights = W))
+  ) -> estm
+
+
+if(cluster_by == "flat"){
+  c(
+    estm[1:5] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_U$adresado_01_klic))),
+    estm[6:10] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_EA$adresado_01_klic)))
+  ) -> estm_ctest
+}else{
+  c(
+    estm[1:5] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_U$adresado_01_klic))),
+    estm[6:10] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_EA$adresado_01_klic)))
+  ) -> estm_ctest
+}
+
+get_tables(estm, estm_ctest, space = FALSE, 
+           reorder = c(6,7,8,9,10,1,2,3,4,5)) %>% 
+  mutate_all(replace_na,"") %>% 
+  kable(
+    col.names = c(
+      "Variable",
+      str_c("(",1:10,")")
+    )
+  )
+```
+
+#### Table A2: First-stage regressions results for IV estimates in Table 4, matched sample // Table A1 in the last version of the manuscript
+
+```{r}
+### First stage
+modeliv <- modeliv_1ststage %>% lapply(update, ownership ~ .)
+
+modeliv[[1]] <- ownership ~ I(as.numeric(sample_dummy)) - 1
+
+c(
+  modeliv %>% lapply(function(x) lm(x, data = reg_data_U, weights = W)),
+  modeliv %>% lapply(function(x) lm(x, data = reg_data_EA, weights = W))
+  ) -> estm
+
+
+if(cluster_by == "flat"){
+  c(
+    estm[1:5] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_U$adresado_01_klic))),
+    estm[6:10] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_EA$adresado_01_klic)))
+  ) -> estm_ctest
+}else{
+  c(
+    estm[1:5] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_U$adresado_01_klic))),
+    estm[6:10] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_EA$adresado_01_klic)))
+  ) -> estm_ctest
+}
+
+get_tables(estm, estm_ctest, space = FALSE, reorder = c(6,7,8,9,10,1,2,3,4,5)) %>% 
+  mutate_all(replace_na,"") %>% 
+  kable(
+    col.names = c(
+      "Variable",
+      str_c("(",1:10,")")
+    )
+  )
+```
+
+
+
+
+
+
+## Additional analysis
+
+```{r}
+model_robust <- model_individual %>% lapply(update, . ~ I(sample != "NTR") + . - ownership)
+
+# Remove incomplete observations
+model_robust %>% 
+  lapply(all.vars) %>% 
+  unlist() %>% 
+  unique() %>% 
+  c("flat_ID","sample","RZSJ","MALE",.) -> all_vars
+
+r01_data_x <- r01_data_basic %>%
+  dplyr::select(one_of(all_vars),adresado_01_klic) %>% 
+  drop_na()
+```
+
+Columns 1 and 5
+
+```{r}
+privX <- r01_data %>% filter(!is.na(Act), priv_year == "2001-2005") %>% distinct(adresado_01_klic) %>% pull(adresado_01_klic)
+
+# Houses sample
+r91_houses %>% 
+  filter(adresado_01_klic %in% privX | sample == "NTR") %>% 
+  mutate(
+    sample = ifelse(sample == "NTR","NTR","ATT")
+  ) %>% 
+  dplyr::select(-Act) %>% 
+  filter(adresado_01_klic %in% r01_data_basic$adresado_01_klic) %>% 
+  rename(JPOCBYT = POC_BYTU) %>% 
+  mutate(
+    byty = cut(JPOCBYT, c(0,10,20,40), right = FALSE)
+  ) %>% 
+  drop_na() %>% 
+  rename(BornBrno = BB) -> r91_houses_sample1
+
+att_selection <- glm(update(model_propscore, I(sample == "ATT") ~ . ), data = r91_houses_sample1, family = binomial("logit"))
+
+r91_houses_sample1 %>% 
+  predict.glm(att_selection, type = "response", newdata = .) -> r91_houses_sample1$pscore
+
+reg_data_EA <- get_matched.geo(r91_houses_sample1, d_caliper, d_distance) %>% 
+  magrittr::extract2("match") %>% 
+  left_join(r01_data_x) %>% drop_na()
+
+reg_data_U <- reg_data_EA %>% filter(LEKAKTI %in% c(1,5))
+
+c(
+  model_robust[1:5] %>% lapply(function(x) lm(x, data = reg_data_U, weights = W)),
+  model_robust[6:10] %>% lapply(function(x) lm(x, data = reg_data_EA, weights = W))
+  ) -> estm
+
+if(cluster_by == "flat"){
+  c(
+    estm[1:5] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_U$flat_ID))),
+    estm[6:10] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_EA$flat_ID)))
+  ) -> estm_ctest
+}else{
+  c(
+    estm[1:5] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_U$adresado_01_klic))),
+    estm[6:10] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_EA$adresado_01_klic)))
+  ) -> estm_ctest
+}
+
+tab2_model <- estm[c(10,5)]
+tab2_ctest <- estm_ctest[c(10,5)]
+
+```
+
+
+Columns 3 and 7
+
+```{r}
+# Houses sample
+r91_houses %>% 
+  filter((!is.na(Act) & sample == "NTC") | sample == "NTR") %>% 
+  mutate(
+    sample = ifelse(sample == "NTR","NTR","ATT")
+  ) %>% 
+  dplyr::select(-Act) %>% 
+  filter(adresado_01_klic %in% r01_data_basic$adresado_01_klic) %>% 
+  rename(JPOCBYT = POC_BYTU) %>% 
+  mutate(
+    byty = cut(JPOCBYT, c(0,10,20,40), right = FALSE)
+  ) %>% 
+  drop_na() %>% 
+  rename(BornBrno = BB) -> r91_houses_sample1
+
+att_selection <- glm(update(model_propscore, I(sample == "ATT") ~ .), data = r91_houses_sample1, family = binomial("logit"))
+
+r91_houses_sample1 %>% 
+  predict.glm(att_selection, type = "response", newdata = .) -> r91_houses_sample1$pscore
+
+reg_data_EA <- get_matched.geo(r91_houses_sample1, d_caliper, d_distance) %>% 
+  magrittr::extract2("match") %>% 
+  left_join(r01_data_x)
+
+reg_data_U <- reg_data_EA %>% filter(LEKAKTI %in% c(1,5))
+
+c(
+  model_robust[1:5] %>% lapply(function(x) lm(x, data = reg_data_U, weights = W)),
+  model_robust[6:10] %>% lapply(function(x) lm(x, data = reg_data_EA, weights = W))
+  ) -> estm
+
+if(cluster_by == "flat"){
+  c(
+    estm[1:5] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_U$flat_ID))),
+    estm[6:10] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_EA$flat_ID)))
+  ) -> estm_ctest
+}else{
+  c(
+    estm[1:5] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_U$adresado_01_klic))),
+    estm[6:10] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_EA$adresado_01_klic)))
+  ) -> estm_ctest
+}
+
+tab3_model <- estm[c(10,5)]
+tab3_ctest <- estm_ctest[c(10,5)]
+
+```
+
+Columns 2 and 6
+
+```{r}
+privX <- r01_data %>% filter(!is.na(Act), priv_year == ">2005") %>% distinct(adresado_01_klic) %>% pull(adresado_01_klic)
+
+# Houses sample
+r91_houses %>% 
+  filter(adresado_01_klic %in% privX | sample == "NTR") %>% 
+  mutate(
+    sample = ifelse(sample == "NTR","NTR","ATT")
+  ) %>% 
+  dplyr::select(-Act) %>% 
+  filter(adresado_01_klic %in% r01_data_basic$adresado_01_klic) %>% 
+  rename(JPOCBYT = POC_BYTU) %>% 
+  mutate(
+    byty = cut(JPOCBYT, c(0,10,20,40), right = FALSE)
+  ) %>% 
+  drop_na() %>% 
+  rename(BornBrno = BB) -> r91_houses_sample1
+
+att_selection <- glm(update(model_propscore, I(sample == "ATT") ~ .), data = r91_houses_sample1, family = binomial("logit"))
+
+r91_houses_sample1 %>% 
+  predict.glm(att_selection, type = "response", newdata = .) -> r91_houses_sample1$pscore
+
+reg_data_EA <- get_matched.geo(r91_houses_sample1, d_caliper, d_distance) %>% 
+  magrittr::extract2("match") %>% 
+  left_join(r01_data_x)
+
+reg_data_U <- reg_data_EA %>% filter(LEKAKTI %in% c(1,5))
+
+c(
+  model_robust[1:5] %>% lapply(function(x) lm(x, data = reg_data_U, weights = W)),
+  model_robust[6:10] %>% lapply(function(x) lm(x, data = reg_data_EA, weights = W))
+  ) -> estm
+
+if(cluster_by == "flat"){
+  c(
+    estm[1:5] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_U$flat_ID))),
+    estm[6:10] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_EA$flat_ID)))
+  ) -> estm_ctest
+}else{
+  c(
+    estm[1:5] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_U$adresado_01_klic))),
+    estm[6:10] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_EA$adresado_01_klic)))
+  ) -> estm_ctest
+}
+
+tab4_model <- estm[c(10,5)]
+tab4_ctest <- estm_ctest[c(10,5)]
+```
+
+Columns 4 and 8
+
+```{r}
+# Houses sample
+r91_houses %>% 
+  filter(is.na(Act) | sample == "NTR") %>% 
+  mutate(
+    sample = ifelse(sample == "NTR","NTR","ATT")
+  ) %>% 
+  dplyr::select(-Act) %>% 
+  filter(adresado_01_klic %in% r01_data_basic$adresado_01_klic) %>% 
+  rename(JPOCBYT = POC_BYTU) %>% 
+  mutate(
+    byty = cut(JPOCBYT, c(0,10,20,40), right = FALSE)
+  ) %>% 
+  drop_na() %>% 
+  rename(BornBrno = BB) -> r91_houses_sample1
+
+att_selection <- glm(update(model_propscore, I(sample == "ATT") ~ .), data = r91_houses_sample1, family = binomial("logit"))
+
+r91_houses_sample1 %>% 
+  predict.glm(att_selection, type = "response", newdata = .) -> r91_houses_sample1$pscore
+
+reg_data_EA <- get_matched.geo(r91_houses_sample1, d_caliper, d_distance) %>% 
+  magrittr::extract2("match") %>% 
+  left_join(r01_data_x)
+
+reg_data_U <- reg_data_EA %>% filter(LEKAKTI %in% c(1,5))
+
+c(
+  model_robust[1:5] %>% lapply(function(x) lm(x, data = reg_data_U, weights = W)),
+  model_robust[6:10] %>% lapply(function(x) lm(x, data = reg_data_EA, weights = W))
+  ) -> estm
+
+if(cluster_by == "flat"){
+  c(
+    estm[1:5] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_U$flat_ID))),
+    estm[6:10] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_EA$flat_ID)))
+  ) -> estm_ctest
+}else{
+  c(
+    estm[1:5] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_U$adresado_01_klic))),
+    estm[6:10] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_EA$adresado_01_klic)))
+  ) -> estm_ctest
+}
+
+tab5_model <- estm[c(10,5)]
+tab5_ctest <- estm_ctest[c(10,5)]
+```
+
+
+
+#### Table 7: Labor market activity of individuals living in the public housing stock as of 2001, by designation and privatization status, and individuals in restituted houses, OLS estimates on matched samples // Table 8 in the last version of the manuscript
+
+```{r} 
+estm <- c(#tab1_model, 
+          tab2_model, 
+          tab4_model,
+          tab3_model,
+          tab5_model)
+estm_ctest <- c(#tab1_ctest, 
+                tab2_ctest,
+                tab4_ctest,
+                tab3_ctest,
+                tab5_ctest)
+
+get_tables(estm, estm_ctest, space = FALSE) %>% 
+  mutate_all(replace_na,"") %>% 
+  kable(
+    col.names = c(
+      "Variable",
+      str_c("(",1:8,")")
+    )
+  )
+```
+
+
+#### Table 6: Year of privatization and labor market outcomes of individuals living in privatized houses (OLS, 2000 is the omitted category) // Table 7 in the last version of the manuscript
+
+```{r}
+model_y <- model[c(5,10)] %>% 
+  lapply(update, . ~ fyear + . - ownership)
+
+all_vars <- model_y %>%  lapply(all.vars) %>% unlist() %>% unique() %>% c(.,"adresado_01_klic")
+
+load("DATA_RP/IDOB.RData")
+load("DATA_RP/privyear.RData")
+
+selected_privatized <- left_join(IDOB,privyear) %>% 
+  drop_na()
+
+r01_data_x <- r01_data_basic %>% 
+  filter(adresado_01_klic %in% selected_privatized$adresado_01_klic) %>% 
+  left_join(selected_privatized) %>% 
+  filter(year <= 2000) %>% 
+  filter(!is.na(Act)) %>% 
+  mutate(
+    fyear = as.factor(year) %>% relevel(ref = "2000")
+  ) %>%
+  dplyr::select(one_of(all_vars)) %>% 
+  drop_na()
+
+reg_data_wa <- r01_data_x
+reg_data_ea <- r01_data_x %>% filter(LEKAKTI %in% c(1,5))
+
+
+c(
+  model_y[1] %>% lapply(function(x) lm(x, data = reg_data_ea)),
+  model_y[2] %>% lapply(function(x) lm(x, data = reg_data_wa))
+  ) -> estm
+
+if(cluster_by == "flat"){
+  c(
+    estm[1] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_ea$flat_ID))),
+    estm[2] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_wa$flat_ID)))
+  ) -> estm_ctest
+}else{
+  c(
+    estm[1] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_ea$adresado_01_klic))),
+    estm[2] %>% lapply(function(x) coeftest(x, vcov. = vcovCL(x, reg_data_wa$adresado_01_klic)))
+  ) -> estm_ctest
+}
+
+    flev <- c(
+      "fyear1998",
+      "fyear1999",
+      "fyear2001",
+      "fyear2002",
+      "fyear2003",
+      "EDUCmiddle",
+      "EDUChigh",
+      "EXP",
+      "I((EXP^2)/100)",
+      "LPOHLAVmale",
+      "BornBrno",
+      "htypeIncomplete_family",
+      "htypeOne_person_household",
+      "(Intercept)",
+      "LVEKfe",
+      "RZSJfe"
+    )
+    
+    flab <- c(
+      "Living in a house privatized in 1998 (=1)",
+      "Living in a house privatized in 1999 (=1)",
+      "Living in a house privatized in 2001 (=1)",
+      "Living in a house privatized in 2002 (=1)",
+      "Living in a house privatized in 2003 (=1)",
+      "Secondary education (=1)",
+      "Tertiary education (=1)",
+      "Potential experience",
+      "Potential experience$^2/100$",
+      "Male (=1)",
+      "Born in Brno (=1)",
+      "Incomplete family (=1)",
+      "One-person family (=1)",
+      "Constant",
+      "Age dummies",
+      "Neighborhood dummies"
+    )
+    
+    ylabs <- list()
+    ylabs$flev <- flev
+    ylabs$flab <- flab
+
+get_tables(estm, estm_ctest, labels = ylabs, space = FALSE, reorder = c(2,1)) %>% 
+  mutate_all(replace_na,"") %>% 
+  kable(
+    col.names = c(
+      "Variable",
+      str_c("(",1:2,")")
+    )
+  )
+
+```
+
